@@ -10,24 +10,14 @@ const bot = new TelegramBot(token, { polling: true });
 const reminders: Map<number, string> = new Map();
 const pendingReminders: Map<number, NodeJS.Timeout[]> = new Map();
 
-const sendReminderWithButton = (chatId: number, message: string) => {
-  const options = {
-    reply_markup: {
-      inline_keyboard: [[{ text: "✅ Я выпила!", callback_data: "confirmed" }]],
-    },
-  };
-
-  bot.sendMessage(chatId, `🔔 ${message}`, options);
-};
-
 const startRepeatReminders = (chatId: number, message: string) => {
   // Clear any existing repeat reminders for this user
   clearRepeatReminders(chatId);
 
   const intervals: NodeJS.Timeout[] = [];
 
-  // Set up repeat every 5 minutes (12 times max = 1 hour total)
-  for (let i = 1; i <= 12; i++) {
+  // Set up repeat every 5 minutes (36 times max = 3 hours total)
+  for (let i = 1; i <= 36; i++) {
     const timeout = setTimeout(() => {
       sendReminderWithButton(chatId, message);
       console.log(`Repeat reminder ${i} sent to ${chatId}`);
@@ -47,6 +37,16 @@ const clearRepeatReminders = (chatId: number) => {
     pendingReminders.delete(chatId);
     console.log(`Cleared repeat reminders for ${chatId}`);
   }
+};
+
+const sendReminderWithButton = (chatId: number, message: string) => {
+  const options = {
+    reply_markup: {
+      inline_keyboard: [[{ text: "✅ Я выпила!", callback_data: "confirmed" }]],
+    },
+  };
+
+  bot.sendMessage(chatId, `🔔 ${message}`, options);
 };
 
 // Handle /start command
@@ -75,7 +75,7 @@ bot.on("callback_query", (callbackQuery) => {
 
   if (data === "set_reminder" && chatId) {
     const reminderText = "Солнце, пора пить колёсики";
-
+    console.log("Setting reminder for", chatId);
     // Store the reminder
     reminders.set(chatId, reminderText);
 
