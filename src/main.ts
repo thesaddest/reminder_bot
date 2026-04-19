@@ -7,8 +7,11 @@ dotenv.config();
 const token = process.env.BOT_TOKEN!;
 const bot = new TelegramBot(token, { polling: true });
 
-const reminders: Map<number, string> = new Map();
+const subscribers: Set<number> = new Set();
 const pendingReminders: Map<number, NodeJS.Timeout[]> = new Map();
+
+const NOON_MESSAGE = "Солнце, пора пить колёсики (дневные 💊)";
+const EVENING_MESSAGE = "Солнце, пора пить колёсики (вечерние 🌙)";
 
 const startRepeatReminders = (chatId: number, message: string) => {
   // Clear any existing repeat reminders for this user
@@ -74,46 +77,43 @@ bot.on("callback_query", (callbackQuery) => {
   const chatId = message?.chat.id;
 
   if (data === "set_reminder" && chatId) {
-    const reminderText = "Солнце, пора пить колёсики";
     console.log("Setting reminder for", chatId);
-    // Store the reminder
-    reminders.set(chatId, reminderText);
+    subscribers.add(chatId);
 
     bot.sendMessage(
       chatId,
-      `✅ Напоминашка поставлена ⏰ Повторяется каждый день в 20:00`
+      `✅ Напоминашка поставлена ⏰ Повторяется каждый день в 12:00 и в 20:00`
     );
   } else if (data === "confirmed" && chatId) {
     // User confirmed they took the medication
     clearRepeatReminders(chatId);
 
-    bot.sendMessage(chatId, `🎉 Отлично, солнышко! Увидимся завтра в 20:00 💊`);
+    bot.sendMessage(chatId, `🎉 Отлично, солнышко! До следующего напоминания 💊`);
   }
 
   // Answer the callback query to remove loading state
   bot.answerCallbackQuery(callbackQuery.id);
 });
 
+const sendDailyReminders = (message: string) => {
+  console.log(`Sending daily reminders: "${message}"`);
+
+  subscribers.forEach((chatId) => {
+    sendReminderWithButton(chatId, message);
+    startRepeatReminders(chatId, message);
+    console.log(`Initial reminder sent to ${chatId}`);
+  });
+};
+
+// Daily reminder at 12:00 PM (noon)
+cron.schedule("0 12 * * *", () => sendDailyReminders(NOON_MESSAGE), {
+  timezone: "Europe/Warsaw",
+});
+
 // Daily reminder at 8:00 PM
-cron.schedule(
-  "0 20 * * *",
-  () => {
-    console.log("Sending daily reminders...");
-
-    reminders.forEach((message, chatId) => {
-      // Send initial reminder with confirmation button
-      sendReminderWithButton(chatId, message);
-
-      // Start repeat reminders every 5 minutes
-      startRepeatReminders(chatId, message);
-
-      console.log(`Initial reminder sent to ${chatId}`);
-    });
-  },
-  {
-    timezone: "Europe/Warsaw",
-  }
-);
+cron.schedule("0 20 * * *", () => sendDailyReminders(EVENING_MESSAGE), {
+  timezone: "Europe/Warsaw",
+});
 
 // Cleanup on bot shutdown
 process.on("SIGINT", () => {
