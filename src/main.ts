@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import cron from "node-cron";
 import TelegramBot from "node-telegram-bot-api";
+import { POLLING_VERSION, runTelegramPolling, safeErrorMessage } from "./polling";
 
 dotenv.config();
 
@@ -10,13 +11,11 @@ if (!token) {
   throw new Error("BOT_TOKEN is not configured");
 }
 
-const BASE_POLLING_INTERVAL_MS = 300;
-const MAX_POLLING_BACKOFF_MS = 30_000;
-const pollingOptions = {
-  interval: BASE_POLLING_INTERVAL_MS,
-  params: { timeout: 30 },
-};
-const bot = new TelegramBot(token, { polling: pollingOptions });
+const bot = new TelegramBot(token, {
+  polling: false,
+  request: { timeout: 15_000 } as TelegramBot.ConstructorOptions["request"],
+});
+const pollingController = new AbortController();
 
 type TelegramApiError = Error & {
   code?: string;
@@ -30,13 +29,13 @@ type TelegramApiError = Error & {
 };
 
 const getErrorMessage = (error: unknown) => {
-  const telegramError = error as TelegramApiError;
-  return telegramError.response?.body?.description ?? telegramError.message ?? String(error);
+  const telegramError = error as TelegramApiError | null;
+  return safeErrorMessage(telegramError?.response?.body?.description ?? error);
 };
 
 const logTelegramError = (operation: string, error: unknown) => {
   // Do not log the entire error object: it can contain a request URL with the bot token.
-  console.error(`${operation}: ${getErrorMessage(error)}`);
+  console.error(`${new Date().toISOString()} ${operation}: ${getErrorMessage(error)}`);
 };
 
 const sendMessage = async (
@@ -67,8 +66,7 @@ const startRepeatReminders = (chatId: number, message: string) => {
   // Set up repeat every 5 minutes (36 times max = 3 hours total)
   for (let i = 1; i <= 36; i++) {
     const timeout = setTimeout(() => {
-      sendReminderWithButton(chatId, message);
-      console.log(`Repeat reminder ${i} sent to ${chatId}`);
+      void sendReminderWithButton(chatId, message);
     }, i * 5 * 60 * 1000); // 5 minutes intervals
 
     intervals.push(timeout);
@@ -87,18 +85,19 @@ const clearRepeatReminders = (chatId: number) => {
   }
 };
 
-const sendReminderWithButton = (chatId: number, message: string) => {
+const sendReminderWithButton = async (chatId: number, message: string) => {
   const options = {
     reply_markup: {
       inline_keyboard: [[{ text: "✅ Я выпила!", callback_data: "confirmed" }]],
     },
   };
 
-  void sendMessage(
+  const sent = await sendMessage(
     chatId,
     `🔔 ${message}\n\nЕсли кнопка не отвечает: /taken`,
     options
   );
+  if (sent) console.log(`${new Date().toISOString()} Reminder delivered to ${chatId}`);
 };
 
 const confirmMedication = (chatId: number, messageId?: number) => {
@@ -135,7 +134,7 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// A regular message remains usable after a polling outage, unlike an expired callback query.
+// This also needs polling to recover, but has no callback acknowledgement deadline.
 bot.onText(/^\/taken(?:@\w+)?(?:\s|$)/i, (msg) => {
   confirmMedication(msg.chat.id);
 });
@@ -144,6 +143,7 @@ bot.on("callback_query", (callbackQuery) => {
   const message = callbackQuery.message;
   const data = callbackQuery.data;
   const chatId = message?.chat.id;
+  console.log(`${new Date().toISOString()} Callback received for ${chatId}`);
 
   // Start acknowledging immediately. The action below must still run if this request fails
   // because Telegram can expire callback query IDs during an outage.
@@ -168,9 +168,8 @@ const sendDailyReminders = (message: string) => {
   console.log(`Sending daily reminders: "${message}"`);
 
   subscribers.forEach((chatId) => {
-    sendReminderWithButton(chatId, message);
+    void sendReminderWithButton(chatId, message);
     startRepeatReminders(chatId, message);
-    console.log(`Initial reminder sent to ${chatId}`);
   });
 };
 
@@ -185,57 +184,28 @@ cron.schedule("0 20 * * *", () => sendDailyReminders(EVENING_MESSAGE), {
 });
 
 // Cleanup on bot shutdown
-process.on("SIGINT", () => {
+const shutdown = () => {
   console.log("Cleaning up...");
+  pollingController.abort();
   pendingReminders.forEach((_, chatId) => {
     clearRepeatReminders(chatId);
   });
   process.exit(0);
-});
-
-let consecutivePollingErrors = 0;
-let resetPollingBackoff: NodeJS.Timeout | undefined;
-
-const markPollingHealthy = () => {
-  consecutivePollingErrors = 0;
-  pollingOptions.interval = BASE_POLLING_INTERVAL_MS;
-  if (resetPollingBackoff) {
-    clearTimeout(resetPollingBackoff);
-    resetPollingBackoff = undefined;
-  }
 };
-
-bot.on("message", markPollingHealthy);
-bot.on("callback_query", markPollingHealthy);
-
-bot.on("polling_error", (error) => {
-  consecutivePollingErrors += 1;
-
-  const telegramError = error as TelegramApiError;
-  const retryAfterMs =
-    (telegramError.response?.body?.parameters?.retry_after ?? 0) * 1000;
-  const exponentialBackoffMs = Math.min(
-    MAX_POLLING_BACKOFF_MS,
-    1000 * 2 ** (consecutivePollingErrors - 1)
-  );
-
-  // node-telegram-bot-api reads this value before scheduling its next poll.
-  pollingOptions.interval = Math.max(retryAfterMs, exponentialBackoffMs);
-
-  if (resetPollingBackoff) clearTimeout(resetPollingBackoff);
-  resetPollingBackoff = setTimeout(() => {
-    consecutivePollingErrors = 0;
-    pollingOptions.interval = BASE_POLLING_INTERVAL_MS;
-    resetPollingBackoff = undefined;
-  }, Math.max(60_000, pollingOptions.interval * 2));
-
-  console.error(
-    `Polling failed; retrying in ${Math.ceil(pollingOptions.interval / 1000)}s: ${getErrorMessage(error)}`
-  );
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 bot.on("error", (error) => {
   logTelegramError("Bot error", error);
 });
 
-console.log("Bot is running...");
+console.log(`${new Date().toISOString()} Bot is running (${POLLING_VERSION})`);
+void runTelegramPolling({
+  token,
+  signal: pollingController.signal,
+  processUpdate: (update) => bot.processUpdate(update),
+  log: (message) => console.log(`${new Date().toISOString()} ${message}`),
+}).catch((error) => {
+  logTelegramError("Polling terminated unexpectedly", error);
+  process.exit(1);
+});
